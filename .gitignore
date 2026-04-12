@@ -1,3 +1,6 @@
+#encrypted data
+.env
+
 # Logs
 logs
 *.log
