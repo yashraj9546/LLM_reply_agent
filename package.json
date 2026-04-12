@@ -1,0 +1,42 @@
+{
+  "name": "project-x-mock",
+  "version": "1.0.0",
+  "description": "Project X — Mock server for local development (WhatsApp + Shopify webhook simulation)",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "node --watch index.js",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [
+    "project-x",
+    "mock",
+    "whatsapp",
+    "shopify",
+    "gemini"
+  ],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "@google/generative-ai": "^0.24.1",
+    "@pinecone-database/pinecone": "^7.2.0",
+    "@prisma/client": "^6.19.3",
+    "axios": "^1.15.0",
+    "bcryptjs": "^3.0.3",
+    "body-parser": "^2.2.2",
+    "dotenv": "^17.4.2",
+    "express": "^5.2.1",
+    "jsonwebtoken": "^9.0.3",
+    "prisma": "^6.19.3"
+  },
+  "devDependencies": {
+    "@prisma/config": "^7.7.0",
+    "@types/bcryptjs": "^2.4.6",
+    "@types/jsonwebtoken": "^9.0.10",
+    "@types/node": "^25.6.0",
+    "effect": "^3.21.0",
+    "tsx": "^4.21.0",
+    "typescript": "^6.0.2"
+  }
+}
