@@ -39,24 +39,69 @@ const pineconeIndex = pinecone.index<ProductVectorMetadata>(INDEX_NAME);
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
 /**
- * Embed a single text string via Gemini `text-embedding-004`.
- *
- * @param text     — The text to embed.
- * @param taskType — Improves quality: use `RETRIEVAL_DOCUMENT` when indexing,
- *                   `RETRIEVAL_QUERY` when searching.
+ * Helper to pause execution for a given number of milliseconds.
+ */
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+/**
+ * Embed a single text string via Gemini `gemini-embedding-001`.
+ * Includes a simple retry mechanism for 429 (Rate Limit) errors.
  */
 async function embedText(
   text: string,
   taskType: TaskType,
+  retries = 3,
 ): Promise<number[]> {
-  const model = genAI.getGenerativeModel({ model: 'text-embedding-004' });
+  const model = genAI.getGenerativeModel({ model: 'gemini-embedding-001' });
 
-  const result = await model.embedContent({
-    content: { role: 'user', parts: [{ text }] },
-    taskType,
-  });
+  try {
+    const result = await model.embedContent({
+      content: { role: 'user', parts: [{ text }] },
+      taskType,
+    });
+    return result.embedding.values;
+  } catch (error: any) {
+    const status = error.status || error.response?.status;
+    if (retries > 0 && status === 429) {
+      const waitTime = 5000 * (4 - retries); // 5s, 10s, 15s...
+      console.warn(`[RAG:Embedding] Rate limited (429). Retrying in ${waitTime}ms...`);
+      await sleep(waitTime);
+      return embedText(text, taskType, retries - 1);
+    }
+    throw error;
+  }
+}
 
-  return result.embedding.values;
+/**
+ * Embed multiple texts in one call via `batchEmbedContents`.
+ * This is more efficient for staying within quota.
+ */
+async function embedBatch(
+  texts: string[],
+  taskType: TaskType,
+  retries = 3,
+): Promise<number[][]> {
+  const model = genAI.getGenerativeModel({ model: 'gemini-embedding-001' });
+
+  try {
+    const result = await model.batchEmbedContents({
+      requests: texts.map((text) => ({
+        content: { role: 'user', parts: [{ text }] },
+        taskType,
+      })),
+    });
+
+    return result.embeddings.map((e) => e.values);
+  } catch (error: any) {
+    const status = error.status || error.response?.status;
+    if (retries > 0 && status === 429) {
+      const waitTime = 10000 * (4 - retries); // 10s, 20s, 30s...
+      console.warn(`[RAG:BatchEmbedding] Rate limited (429). Retrying batch in ${waitTime}ms...`);
+      await sleep(waitTime);
+      return embedBatch(texts, taskType, retries - 1);
+    }
+    throw error;
+  }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -86,23 +131,31 @@ export async function syncInventoryToPinecone(): Promise<SyncReport> {
 
   console.log(`[RAG:Sync] Found ${variants.length} variant(s). Embedding …`);
 
-  // 2. Build embedding text and generate vectors
-  const records = await Promise.all(
-    variants.map(async (v) => {
-      const textToEmbed = [
-        `Title: ${v.product.title}`,
-        `Category: ${v.product.category ?? 'N/A'}`,
-        `Description: ${v.product.description ?? 'N/A'}`,
-        `Color: ${v.color ?? 'N/A'}`,
-        `Size: ${v.size ?? 'N/A'}`,
-        `SKU: ${v.sku}`,
-      ].join(', ');
+  // 2. Process variants in chunks using batchEmbedContents
+  const records = [];
+  const EMBEDDING_CHUNK_SIZE = 30; // Processing 30 at a time via batch API
+  
+  console.log(`[RAG:Sync] Processing ${variants.length} variants in ${Math.ceil(variants.length / EMBEDDING_CHUNK_SIZE)} chunks...`);
 
-      const values = await embedText(textToEmbed, TaskType.RETRIEVAL_DOCUMENT);
+  for (let i = 0; i < variants.length; i += EMBEDDING_CHUNK_SIZE) {
+    const chunk = variants.slice(i, i + EMBEDDING_CHUNK_SIZE);
+    
+    const textsToEmbed = chunk.map(v => [
+      `Title: ${v.product.title}`,
+      `Category: ${v.product.category ?? 'N/A'}`,
+      `Description: ${v.product.description ?? 'N/A'}`,
+      `Color: ${v.color ?? 'N/A'}`,
+      `Size: ${v.size ?? 'N/A'}`,
+      `SKU: ${v.sku}`,
+    ].join(', '));
 
+    // Get all embeddings for this chunk in ONE API call
+    const allValues = await embedBatch(textsToEmbed, TaskType.RETRIEVAL_DOCUMENT);
+
+    const chunkRecords = chunk.map((v, index) => {
       return {
-        id: String(v.id), // Crucial: variant PK → Pinecone id
-        values,
+        id: String(v.id),
+        values: allValues[index],
         metadata: {
           title: v.product.title,
           category: v.product.category ?? 'N/A',
@@ -112,8 +165,18 @@ export async function syncInventoryToPinecone(): Promise<SyncReport> {
           productId: v.product.id,
         } satisfies ProductVectorMetadata,
       };
-    }),
-  );
+    });
+
+    records.push(...chunkRecords);
+    
+    // Progress update
+    console.log(`[RAG:Sync] Embedded ${records.length} / ${variants.length} records...`);
+    
+    // Safety delay between batches (even with batch API, we need to respect RPM)
+    if (i + EMBEDDING_CHUNK_SIZE < variants.length) {
+      await sleep(3000); 
+    }
+  }
 
   // 3. Upsert in batches of 100 (Pinecone best practice)
   const BATCH_SIZE = 100;
