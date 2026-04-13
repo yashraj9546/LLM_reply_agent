@@ -1,142 +1,237 @@
-// services/rag.service.ts
-import { Pinecone, PineconeRecord } from '@pinecone-database/pinecone';
-import { GoogleGenerativeAI } from '@google/generative-ai';
-import { prisma } from '../lib/prisma'; // Using Prisma client for DB queries
+/**
+ * services/rag.service.ts
+ * ─────────────────────────────────────────────────────────────────────────────
+ * Production RAG pipeline — Pinecone + Gemini + PostgreSQL.
+ *
+ * Exports:
+ *   • syncInventoryToPinecone()  — Step 2: Postgres → embed → Pinecone
+ *   • getAgentResponse()         — Step 3: user query → vector search →
+ *                                           DB enrich → Gemini answer
+ *
+ * SDK versions targeted:
+ *   @pinecone-database/pinecone  ^7.x   (uses { records: [...] } upsert)
+ *   @google/generative-ai        ^0.24  (embedContent with taskType)
+ * ─────────────────────────────────────────────────────────────────────────────
+ */
 
-// 1. Initialize API Clients
+import { Pinecone } from '@pinecone-database/pinecone';
+import { GoogleGenerativeAI, TaskType } from '@google/generative-ai';
+import { prisma } from '../lib/prisma';
+
+import type {
+  ProductVectorMetadata,
+  EnrichedProduct,
+  AgentResponse,
+  SyncReport,
+} from './rag.types';
+
+// ── Client Singletons ────────────────────────────────────────────────────────
+
 const pinecone = new Pinecone({
   apiKey: process.env.PINECONE_API_KEY as string,
 });
 
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY as string);
 
-// Target Pinecone Index
-const pineconeIndex = pinecone.index(process.env.PINECONE_INDEX_NAME || 'ecommerce-index');
+const INDEX_NAME = process.env.PINECONE_INDEX_NAME || 'ecommerce-index';
+const pineconeIndex = pinecone.index<ProductVectorMetadata>(INDEX_NAME);
+
+// ── Helpers ──────────────────────────────────────────────────────────────────
 
 /**
- * Step 2: Inventory Sync Logic (Postgres -> Pinecone)
- * Fetches all products/variants via Prisma, embeds them via Gemini, and upserts to Pinecone.
+ * Embed a single text string via Gemini `text-embedding-004`.
+ *
+ * @param text     — The text to embed.
+ * @param taskType — Improves quality: use `RETRIEVAL_DOCUMENT` when indexing,
+ *                   `RETRIEVAL_QUERY` when searching.
  */
-export async function syncInventoryToPinecone() {
-  try {
-    console.log('Fetching inventory from PostgreSQL...');
-    
-    // 1. Fetch products and variations using the new Prisma models
-    const variants = await prisma.productVariant.findMany({
-      include: {
-        product: true
-      }
-    });
+async function embedText(
+  text: string,
+  taskType: TaskType,
+): Promise<number[]> {
+  const model = genAI.getGenerativeModel({ model: 'text-embedding-004' });
 
-    if (!variants || variants.length === 0) {
-      console.log('No products found to sync.');
-      return;
-    }
+  const result = await model.embedContent({
+    content: { role: 'user', parts: [{ text }] },
+    taskType,
+  });
 
-    // Reference to embedding model
-    const embeddingModel = genAI.getGenerativeModel({ model: 'text-embedding-004' });
-
-    console.log('Preparing vectors for Pinecone...');
-
-    // 2. Prepare vectors mapping
-    const vectors: PineconeRecord[] = await Promise.all(variants.map(async (variant) => {
-      // Build an embedding string capturing essential context
-      const textToEmbed = `Title: ${variant.product.title}, Category: ${variant.product.category || 'N/A'}, Description: ${variant.product.description || 'N/A'}`;
-      
-      // Request embedding
-      const embeddingResult = await embeddingModel.embedContent(textToEmbed);
-      const values = embeddingResult.embedding.values;
-
-      // 3. Construct Vector object strictly adhering to PineconeRecord type
-      return {
-        id: String(variant.id), // Crucial: Using variant.id as Pinecone ID
-        values,
-        metadata: {
-          title: variant.product.title,
-          category: variant.product.category || 'N/A',
-        }
-      };
-    }));
-
-    // 4. Upsert batches into Pinecone
-    const batchSize = 100;
-    for (let i = 0; i < vectors.length; i += batchSize) {
-      const batch = vectors.slice(i, i + batchSize);
-      // Casting to any to bypass Pinecone TS SDK overload resolution issue with arrays
-      await pineconeIndex.upsert(batch as any);
-      console.log(`Upserted batch ${Math.floor(i / batchSize) + 1} of ${Math.ceil(vectors.length / batchSize)}`);
-    }
-
-    console.log('Successfully synced inventory to Pinecone!');
-  } catch (error) {
-    console.error('Error syncing inventory to Pinecone:', error);
-    throw error;
-  }
+  return result.embedding.values;
 }
 
-/**
- * Step 3: The Query & Retrieval Flow
- * Handles user questions, queries vector database, enriches with Postgres, generates natural response.
- */
-export async function getAgentResponse(userMessage: string): Promise<string> {
-  try {
-    // 1. Embed User Input
-    const embeddingModel = genAI.getGenerativeModel({ model: 'text-embedding-004' });
-    const userEmbeddingResult = await embeddingModel.embedContent(userMessage);
-    const userVector = userEmbeddingResult.embedding.values;
+// ─────────────────────────────────────────────────────────────────────────────
+//  STEP 2 — syncInventoryToPinecone
+// ─────────────────────────────────────────────────────────────────────────────
 
-    // 2. Pinecone Query
+/**
+ * Fetches every product variant from Postgres, embeds it with Gemini,
+ * and upserts the resulting vectors + metadata into Pinecone.
+ *
+ * Uses the Postgres `variant.id` as the Pinecone vector id so we can
+ * look the real row up again after a similarity search.
+ */
+export async function syncInventoryToPinecone(): Promise<SyncReport> {
+  const start = Date.now();
+  console.log('[RAG:Sync] Fetching inventory from PostgreSQL …');
+
+  // 1. Pull all variants with their parent product data
+  const variants = await prisma.productVariant.findMany({
+    include: { product: true },
+  });
+
+  if (variants.length === 0) {
+    console.log('[RAG:Sync] No variants found — nothing to sync.');
+    return { totalVariants: 0, batchesUpserted: 0, durationMs: Date.now() - start };
+  }
+
+  console.log(`[RAG:Sync] Found ${variants.length} variant(s). Embedding …`);
+
+  // 2. Build embedding text and generate vectors
+  const records = await Promise.all(
+    variants.map(async (v) => {
+      const textToEmbed = [
+        `Title: ${v.product.title}`,
+        `Category: ${v.product.category ?? 'N/A'}`,
+        `Description: ${v.product.description ?? 'N/A'}`,
+        `Color: ${v.color ?? 'N/A'}`,
+        `Size: ${v.size ?? 'N/A'}`,
+        `SKU: ${v.sku}`,
+      ].join(', ');
+
+      const values = await embedText(textToEmbed, TaskType.RETRIEVAL_DOCUMENT);
+
+      return {
+        id: String(v.id), // Crucial: variant PK → Pinecone id
+        values,
+        metadata: {
+          title: v.product.title,
+          category: v.product.category ?? 'N/A',
+          sku: v.sku,
+          color: v.color ?? 'N/A',
+          size: v.size ?? 'N/A',
+          productId: v.product.id,
+        } satisfies ProductVectorMetadata,
+      };
+    }),
+  );
+
+  // 3. Upsert in batches of 100 (Pinecone best practice)
+  const BATCH_SIZE = 100;
+  let batchesUpserted = 0;
+
+  for (let i = 0; i < records.length; i += BATCH_SIZE) {
+    const batch = records.slice(i, i + BATCH_SIZE);
+    await pineconeIndex.upsert({ records: batch });
+    batchesUpserted++;
+    console.log(
+      `[RAG:Sync] Upserted batch ${batchesUpserted} / ${Math.ceil(records.length / BATCH_SIZE)}`,
+    );
+  }
+
+  const durationMs = Date.now() - start;
+  console.log(`[RAG:Sync] ✅ Done — ${records.length} vectors in ${durationMs}ms`);
+
+  return { totalVariants: records.length, batchesUpserted, durationMs };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  STEP 3 — getAgentResponse
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * End-to-end RAG flow:
+ *  1. Embed the user's question.
+ *  2. Vector-search Pinecone for the top 3 matches.
+ *  3. Enrich with real-time price + stock from Postgres.
+ *  4. Pass everything to Gemini 1.5 Flash for a WhatsApp-style reply.
+ */
+export async function getAgentResponse(userMessage: string): Promise<AgentResponse> {
+  try {
+    // ── 1. Embed user query ────────────────────────────────────────────────
+    console.log(`[RAG:Query] Embedding user message: "${userMessage.slice(0, 60)}…"`);
+    const queryVector = await embedText(userMessage, TaskType.RETRIEVAL_QUERY);
+
+    // ── 2. Pinecone similarity search ─────────────────────────────────────
     const searchResponse = await pineconeIndex.query({
-      vector: userVector,
+      vector: queryVector,
       topK: 3,
-      includeMetadata: false, // Not strictly needed because we enrich below
+      includeMetadata: true,
     });
 
-    const matchIds = searchResponse.matches.map(match => match.id);
+    const matchIds = searchResponse.matches.map((m) => m.id);
 
     if (matchIds.length === 0) {
-      return "I couldn't find any products matching your request. Could you specify further?";
+      return {
+        answer:
+          "I couldn't find any products matching your request. Could you describe what you're looking for in a different way? 🤔",
+        matchedProducts: [],
+      };
     }
 
-    // Convert string IDs from Pinecone back to numbers for Prisma
-    const variantIds = matchIds.map(id => parseInt(id, 10));
+    console.log(`[RAG:Query] Pinecone returned IDs: [${matchIds.join(', ')}]`);
 
-    // 3. Postgres Enrichment using Prisma
-    const inventoryResult = await prisma.productVariant.findMany({
-      where: {
-        id: { in: variantIds }
-      },
-      include: {
-        product: true
-      }
+    // ── 3. Postgres enrichment (real-time price + stock) ──────────────────
+    const variantIds = matchIds.map((id) => parseInt(id, 10));
+
+    const enrichedRows = await prisma.productVariant.findMany({
+      where: { id: { in: variantIds } },
+      include: { product: true },
     });
 
-    // Build context block
-    const inventoryContext = inventoryResult.map((variant) => 
-      `- ${variant.product.title} (Category: ${variant.product.category || 'N/A'}): Price $${variant.price.toString()}. Stock: ${variant.currentStock > 0 ? variant.currentStock : 'Out of Stock'}`
-    ).join('\n');
+    const matchedProducts: EnrichedProduct[] = enrichedRows.map((v) => ({
+      variantId: v.id,
+      productId: v.product.id,
+      title: v.product.title,
+      category: v.product.category ?? 'N/A',
+      sku: v.sku,
+      color: v.color ?? 'N/A',
+      size: v.size ?? 'N/A',
+      price: v.price.toString(),
+      currentStock: v.currentStock,
+      imageUrl: v.imageUrl ?? null,
+    }));
 
-    // 4. Gemini Final Response
-    const generativeModel = genAI.getGenerativeModel({ 
+    // Build a context block for the LLM
+    const inventoryContext = matchedProducts
+      .map(
+        (p) =>
+          `• ${p.title} — ${p.color}/${p.size} (SKU ${p.sku}): ₹${p.price}, ` +
+          `${p.currentStock > 0 ? `${p.currentStock} in stock` : '❌ Out of Stock'}`,
+      )
+      .join('\n');
+
+    // ── 4. Gemini 1.5 Flash — generate WhatsApp-style reply ──────────────
+    const chatModel = genAI.getGenerativeModel({
       model: 'gemini-1.5-flash',
-      systemInstruction: 'You are a warm, helpful online e-commerce agent chatting on WhatsApp. Always provide responses that are conversational, formatting with a touch of appropriate emojis. If items are out of stock, politely inform the user.'
+      systemInstruction: [
+        'You are a warm, helpful e-commerce shopping assistant chatting on WhatsApp.',
+        'Respond conversationally using light emojis.',
+        'If an item is out of stock, politely let the customer know and suggest alternatives from the list.',
+        'Never invent products that are NOT in the provided inventory context.',
+        'Keep responses concise — 3–4 sentences max.',
+      ].join(' '),
     });
-    
-    // Pass original question + verified database context to Gemini
-    const finalPrompt = `
-A customer has asked the following question: "${userMessage}"
 
-Here are the most relevant products strictly matched from our current real-time database to ground your answer:
+    const prompt = `
+Customer question: "${userMessage}"
+
+Real-time inventory matches from our database:
 ${inventoryContext}
 
-Please form a natural response. Instead of rendering rigid lists, include the matched product prices implicitly in a flowing sentence if possible.
-    `;
+Compose a natural, WhatsApp-friendly reply.`.trim();
 
-    const chatResponse = await generativeModel.generateContent(finalPrompt);
-    return chatResponse.response.text();
-    
+    const geminiResponse = await chatModel.generateContent(prompt);
+    const answer = geminiResponse.response.text();
+
+    console.log(`[RAG:Query] Gemini reply generated (${answer.length} chars)`);
+
+    return { answer, matchedProducts };
   } catch (error) {
-    console.error('Error generating agent response:', error);
-    return "I'm sorry, I'm having trouble accessing the inventory right now. Please try again in a moment!";
+    console.error('[RAG:Query] Error:', error);
+    return {
+      answer:
+        "I'm sorry, I'm having trouble accessing the inventory right now. Please try again in a moment! 🙏",
+      matchedProducts: [],
+    };
   }
 }
